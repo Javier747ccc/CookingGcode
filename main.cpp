@@ -5,14 +5,21 @@
 #include <csignal>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#ifndef _WIN32
 #include <fcntl.h>
+#endif
 #include <iostream>
+#include <optional>
 #include <set>
 #include <string>
+#include <utility>
+#ifndef _WIN32
 #include <sys/select.h>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
+#endif
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -24,6 +31,47 @@ volatile std::sig_atomic_t stop_requested = 0;
 void handle_signal(int) {
     stop_requested = 1;
 }
+
+std::string trim(std::string text) {
+    const auto begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return "";
+    }
+    const auto end = text.find_last_not_of(" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+bool run_command_file(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) {
+        std::cerr << "No se pudo abrir el fichero: " << path << '\n';
+        return false;
+    }
+
+    std::string line;
+    int line_number = 0;
+    bool success = true;
+    while (std::getline(file, line)) {
+        ++line_number;
+
+        if (line.rfind("#", 0) == 0) {
+            continue;
+        } else if (line.rfind(":print", 0) == 0) {
+            std::string text = line.substr(6);
+            if (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+                text.erase(0, 1);
+            }
+            std::cout << text << '\n';
+        } else if (!trim(line).empty()) {
+            std::cerr << path << ':' << line_number << ": comando no reconocido: " << line << '\n';
+            success = false;
+        }
+    }
+
+    return success;
+}
+
+#ifndef _WIN32
 
 speed_t to_speed(int baud) {
     switch (baud) {
@@ -67,15 +115,6 @@ bool configure_serial(int fd, int baud) {
     return true;
 }
 
-std::string trim(std::string text) {
-    const auto begin = text.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos) {
-        return "";
-    }
-    const auto end = text.find_last_not_of(" \t\r\n");
-    return text.substr(begin, end - begin + 1);
-}
-
 std::string lower_copy(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -95,6 +134,24 @@ bool is_positive_response(const std::string& response) {
            lower.find("invalid") == std::string::npos &&
            lower.find("unsupported") == std::string::npos &&
            lower.find("no reconocido") == std::string::npos;
+}
+
+std::string clean_name_response(const std::string& response) {
+    const auto cleaned = trim(response);
+
+    const std::vector<std::string> prefixes = {"$/name=", "$name="};
+    for (const auto& prefix : prefixes) {
+        if (cleaned.rfind(prefix, 0) == 0) {
+            auto value = cleaned.substr(prefix.size());
+            const auto line_end = value.find_first_of("\r\n");
+            if (line_end != std::string::npos) {
+                value = value.substr(0, line_end);
+            }
+            return trim(value);
+        }
+    }
+
+    return cleaned;
 }
 
 std::string read_for(int fd, std::chrono::milliseconds timeout) {
@@ -154,11 +211,11 @@ std::vector<std::string> find_usb_serial_ports() {
     return {ports.begin(), ports.end()};
 }
 
-bool query_port(const std::string& port, int baud) {
+std::optional<std::string> query_port(const std::string& port, int baud) {
     const int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
         std::cerr << port << " @ " << baud << ": no se pudo abrir: " << std::strerror(errno) << '\n';
-        return false;
+        return std::nullopt;
     }
 
     const auto close_fd = [fd]() { close(fd); };
@@ -166,7 +223,7 @@ bool query_port(const std::string& port, int baud) {
     if (!configure_serial(fd, baud)) {
         std::cerr << port << " @ " << baud << ": no se pudo configurar: " << std::strerror(errno) << '\n';
         close_fd();
-        return false;
+        return std::nullopt;
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -177,36 +234,30 @@ bool query_port(const std::string& port, int baud) {
     if (written != static_cast<ssize_t>(command.size())) {
         std::cerr << port << " @ " << baud << ": no se pudo escribir $name\n";
         close_fd();
-        return false;
+        return std::nullopt;
     }
 
     const auto response = read_for(fd, std::chrono::milliseconds(1200));
     close_fd();
 
     if (is_positive_response(response)) {
-        std::cout << "Respuesta positiva en " << port << " @ " << baud << ": " << trim(response) << '\n';
-        return true;
+        return clean_name_response(response);
     }
 
-    return false;
+    return std::nullopt;
 }
 
-} // namespace
-
-int main() {
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-
+bool scan_serial_ports() {
     const auto ports = find_usb_serial_ports();
     if (ports.empty()) {
         std::cout << "No se encontraron puertos serie USB (/dev/ttyUSB* o /dev/ttyACM*).\n";
-        return 0;
+        return true;
     }
 
     const std::vector<int> baud_rates = {115200, 250000, 230400, 57600, 38400, 19200, 9600};
     std::cout << "Puertos serie USB encontrados: " << ports.size() << '\n';
 
-    bool found_positive = false;
+    std::vector<std::pair<std::string, std::string>> port_names;
     for (const auto& port : ports) {
         if (stop_requested) {
             break;
@@ -217,8 +268,9 @@ int main() {
             if (stop_requested) {
                 break;
             }
-            if (query_port(port, baud)) {
-                found_positive = true;
+            const auto name = query_port(port, baud);
+            if (name) {
+                port_names.emplace_back(port, *name);
                 port_positive = true;
                 break;
             }
@@ -229,5 +281,39 @@ int main() {
         }
     }
 
-    return found_positive ? 0 : 1;
+    if (!port_names.empty()) {
+        std::cout << "Tabla de puertos encontrados:\n";
+        for (const auto& [port, name] : port_names) {
+            std::cout << '(' << port << ", " << name << ")\n";
+        }
+    }
+
+    return !port_names.empty();
+}
+
+#endif
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+
+    if (argc > 2) {
+        std::cerr << "Uso: " << argv[0] << " [fichero_comandos]\n";
+        return 2;
+    }
+
+#ifdef _WIN32
+    std::cerr << "El escaneo de puertos serie USB solo esta soportado en Linux.\n";
+    bool scan_ok = false;
+#else
+    bool scan_ok = scan_serial_ports();
+#endif
+
+    if (argc == 2) {
+        return run_command_file(argv[1]) ? 0 : 1;
+    }
+
+    return scan_ok ? 0 : 1;
 }
