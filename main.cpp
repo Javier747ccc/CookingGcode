@@ -453,7 +453,7 @@ bool run_command_file(const std::string& path, const std::vector<SerialPortInfo>
                 continue;
             }
 
-            const auto response = trim(read_until_ok(selected_fd, std::chrono::milliseconds(5000)));
+            const auto response = trim(read_until_ok(selected_fd, std::chrono::seconds(60)));
             if (!response.empty()) {
                 std::cout << selected_port->name << ": " << response << '\n';
             }
