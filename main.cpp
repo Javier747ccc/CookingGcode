@@ -111,20 +111,6 @@ bool configure_serial(int fd, int baud) {
     return true;
 }
 
-bool is_positive_response(const std::string& response) {
-    const auto cleaned = trim(response);
-    if (cleaned.empty()) {
-        return false;
-    }
-
-    const auto lower = lower_copy(cleaned);
-    return lower.find("error") == std::string::npos &&
-           lower.find("unknown") == std::string::npos &&
-           lower.find("invalid") == std::string::npos &&
-           lower.find("unsupported") == std::string::npos &&
-           lower.find("no reconocido") == std::string::npos;
-}
-
 bool response_has_ok(const std::string& response) {
     const auto lower = lower_copy(response);
     std::size_t start = 0;
@@ -140,6 +126,46 @@ bool response_has_ok(const std::string& response) {
         start = end + 1;
     }
     return false;
+}
+
+bool response_has_error(const std::string& response) {
+    const auto lower = lower_copy(response);
+    std::size_t start = 0;
+    while (start <= lower.size()) {
+        const auto end = lower.find_first_of("\r\n", start);
+        const auto line = trim(lower.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (line.rfind("error", 0) == 0 ||
+            line.rfind("alarm", 0) == 0 ||
+            line.find("[msg:err") != std::string::npos) {
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+bool response_has_idle_status(const std::string& response) {
+    return lower_copy(response).find("<idle") != std::string::npos;
+}
+
+bool response_has_alarm_status(const std::string& response) {
+    return lower_copy(response).find("<alarm") != std::string::npos;
+}
+
+bool is_g1_command(const std::string& command) {
+    const auto lower = lower_copy(command);
+    if (lower.size() < 2 || lower[0] != 'g' || lower[1] != '1') {
+        return false;
+    }
+    return lower.size() == 2 || std::isspace(static_cast<unsigned char>(lower[2]));
+}
+
+bool is_homing_command(const std::string& command) {
+    const auto lower = lower_copy(command);
+    return lower == "$h" || lower.rfind("$h", 0) == 0;
 }
 
 std::string clean_name_response(const std::string& response) {
@@ -158,6 +184,47 @@ std::string clean_name_response(const std::string& response) {
     }
 
     return cleaned;
+}
+
+bool is_negative_response_line(const std::string& line) {
+    const auto lower = lower_copy(line);
+    return lower == "ok" ||
+           lower.find("[cli]") != std::string::npos ||
+           lower.find("error") != std::string::npos ||
+           lower.find("unknown") != std::string::npos ||
+           lower.find("invalid") != std::string::npos ||
+           lower.find("unsupported") != std::string::npos ||
+           lower.find("no reconocido") != std::string::npos ||
+           lower.find("falta canal") != std::string::npos ||
+           lower.find("usa un valor") != std::string::npos;
+}
+
+bool is_name_response_line(const std::string& line) {
+    if (line.empty() || is_negative_response_line(line)) {
+        return false;
+    }
+
+    return std::all_of(line.begin(), line.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_' || c == '-' || c == '.';
+    });
+}
+
+std::optional<std::string> extract_name_response(const std::string& response) {
+    std::size_t start = 0;
+    while (start <= response.size()) {
+        const auto end = response.find_first_of("\r\n", start);
+        const auto line = trim(response.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        const auto name = clean_name_response(line);
+        if (is_name_response_line(name)) {
+            return name;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return std::nullopt;
 }
 
 std::string read_for(int fd, std::chrono::milliseconds timeout) {
@@ -279,9 +346,8 @@ std::optional<std::string> query_port(const std::string& port, int baud) {
     const auto response = read_for(fd, std::chrono::milliseconds(1200));
     close_fd();
 
-    if (is_positive_response(response)) {
-        const auto name = clean_name_response(response);
-        std::cout << "Respuesta positiva en " << port << " @ " << baud << ": " << name << '\n';
+    if (const auto name = extract_name_response(response)) {
+        std::cout << "Respuesta positiva en " << port << " @ " << baud << ": " << *name << '\n';
         return name;
     }
 
@@ -345,6 +411,33 @@ bool write_all(int fd, const std::string& text) {
         }
     }
     return true;
+}
+
+bool wait_until_complete(int fd, const std::string& port, const std::string& command, bool allow_alarm_status) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(30);
+    while (!stop_requested && std::chrono::steady_clock::now() < deadline) {
+        if (!write_all(fd, "?")) {
+            std::cerr << port << ": no se pudo consultar estado tras: " << command << '\n';
+            return false;
+        }
+
+        const auto response = read_for(fd, std::chrono::milliseconds(1000));
+        if (response_has_error(response)) {
+            std::cerr << port << ": el firmware devolvio error esperando fin de movimiento: " << command << '\n';
+            return false;
+        }
+        if (response_has_idle_status(response)) {
+            return true;
+        }
+        if (allow_alarm_status && response_has_alarm_status(response)) {
+            return true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    std::cerr << port << ": timeout esperando fin de movimiento: " << command << '\n';
+    return false;
 }
 
 std::optional<int> open_serial_port(const SerialPortInfo& info) {
@@ -446,6 +539,8 @@ bool run_command_file(const std::string& path, const std::vector<SerialPortInfo>
                 continue;
             }
 
+            tcflush(selected_fd, TCIFLUSH);
+
             const auto serial_command = command + '\n';
             if (!write_all(selected_fd, serial_command)) {
                 std::cerr << selected_port->port << ": no se pudo enviar: " << command << '\n';
@@ -457,9 +552,20 @@ bool run_command_file(const std::string& path, const std::vector<SerialPortInfo>
             if (!response.empty()) {
                 std::cout << selected_port->name << ": " << response << '\n';
             }
-            if (!response_has_ok(response)) {
+            if (response_has_error(response)) {
+                std::cerr << selected_port->port << ": el firmware devolvio error para: " << command << '\n';
+                success = false;
+            } else if (!response_has_ok(response)) {
                 std::cerr << selected_port->port << ": no se recibio OK para: " << command << '\n';
                 success = false;
+            } else if (is_g1_command(command)) {
+                if (!wait_until_complete(selected_fd, selected_port->port, command, false)) {
+                    success = false;
+                }
+            } else if (is_homing_command(command)) {
+                if (!wait_until_complete(selected_fd, selected_port->port, command, true)) {
+                    success = false;
+                }
             }
 #endif
         }
