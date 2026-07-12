@@ -11,8 +11,9 @@ $x
 g1 a6.5 f100
 g1 a0 f100
 $hb
-g1 b21.4 f100
-g1 z10 f100
+g1 b10 f700
+g1 z10 f300
 :use Cooking1
 g1 y20 f500
 g1 y0 f500
+
