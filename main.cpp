@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cctype>
 #include <csignal>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -12,12 +13,15 @@
 #include <iostream>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
-#ifndef _WIN32
-#include <sys/select.h>
-#include <termios.h>
 #include <thread>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <termios.h>
 #include <unistd.h>
 #endif
 #include <vector>
@@ -49,9 +53,14 @@ std::string lower_copy(std::string text) {
 }
 
 struct SerialPortInfo {
+    enum class Kind { Serial, Ethernet };
+
+    Kind kind = Kind::Serial;
     std::string port;
     std::string name;
-    int baud;
+    int baud = 0;
+    std::string ip;
+    int tcp_port = 0;
 };
 
 struct ScanResult {
@@ -317,6 +326,8 @@ std::vector<std::string> find_usb_serial_ports() {
     return {ports.begin(), ports.end()};
 }
 
+bool write_all(int fd, const std::string& text);
+
 std::optional<std::string> query_port(const std::string& port, int baud) {
     const int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
@@ -354,6 +365,91 @@ std::optional<std::string> query_port(const std::string& port, int baud) {
     return std::nullopt;
 }
 
+std::string endpoint_label(const SerialPortInfo& info) {
+    if (info.kind == SerialPortInfo::Kind::Ethernet) {
+        return info.ip + ':' + std::to_string(info.tcp_port);
+    }
+    return info.port;
+}
+
+std::optional<int> connect_ethernet(const std::string& ip, int tcp_port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        std::cerr << ip << ':' << tcp_port << ": no se pudo crear socket: " << std::strerror(errno) << '\n';
+        return std::nullopt;
+    }
+
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<uint16_t>(tcp_port));
+    if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) != 1) {
+        std::cerr << ip << ':' << tcp_port << ": direccion IP no valida\n";
+        close(fd);
+        return std::nullopt;
+    }
+
+    if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 && errno != EINPROGRESS) {
+        std::cerr << ip << ':' << tcp_port << ": no se pudo conectar: " << std::strerror(errno) << '\n';
+        close(fd);
+        return std::nullopt;
+    }
+
+    fd_set write_set;
+    FD_ZERO(&write_set);
+    FD_SET(fd, &write_set);
+
+    timeval tv{};
+    tv.tv_sec = 5;
+
+    const int ready = select(fd + 1, nullptr, &write_set, nullptr, &tv);
+    if (ready <= 0) {
+        std::cerr << ip << ':' << tcp_port << ": timeout conectando\n";
+        close(fd);
+        return std::nullopt;
+    }
+
+    int socket_error = 0;
+    socklen_t socket_error_size = sizeof(socket_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_size) != 0 || socket_error != 0) {
+        std::cerr << ip << ':' << tcp_port << ": no se pudo conectar: "
+                  << std::strerror(socket_error == 0 ? errno : socket_error) << '\n';
+        close(fd);
+        return std::nullopt;
+    }
+
+    return fd;
+}
+
+std::optional<std::string> query_ethernet_endpoint(const std::string& ip, int tcp_port) {
+    const auto fd = connect_ethernet(ip, tcp_port);
+    if (!fd) {
+        return std::nullopt;
+    }
+
+    const std::string command = "$name\n";
+    if (!write_all(*fd, command)) {
+        std::cerr << ip << ':' << tcp_port << ": no se pudo escribir $name\n";
+        close(*fd);
+        return std::nullopt;
+    }
+
+    const auto response = read_for(*fd, std::chrono::milliseconds(1200));
+    close(*fd);
+
+    if (const auto name = extract_name_response(response)) {
+        std::cout << "Respuesta positiva en " << ip << ':' << tcp_port << ": " << *name << '\n';
+        return name;
+    }
+
+    std::cout << "Sin respuesta positiva en " << ip << ':' << tcp_port << '\n';
+    return std::nullopt;
+}
+
 ScanResult scan_serial_ports() {
     const auto ports = find_usb_serial_ports();
     if (ports.empty()) {
@@ -377,7 +473,7 @@ ScanResult scan_serial_ports() {
             }
             const auto name = query_port(port, baud);
             if (name) {
-                port_names.push_back({port, *name, baud});
+                port_names.push_back({SerialPortInfo::Kind::Serial, port, *name, baud});
                 port_positive = true;
                 break;
             }
@@ -458,6 +554,14 @@ std::optional<int> open_serial_port(const SerialPortInfo& info) {
     return fd;
 }
 
+std::optional<int> open_endpoint(const SerialPortInfo& info) {
+    if (info.kind == SerialPortInfo::Kind::Ethernet) {
+        return connect_ethernet(info.ip, info.tcp_port);
+    }
+
+    return open_serial_port(info);
+}
+
 #endif
 
 bool run_command_file(const std::string& path, const std::vector<SerialPortInfo>& ports) {
@@ -470,9 +574,10 @@ bool run_command_file(const std::string& path, const std::vector<SerialPortInfo>
     std::string line;
     int line_number = 0;
     bool success = true;
+    auto endpoints = ports;
 #ifndef _WIN32
-    const SerialPortInfo* selected_port = nullptr;
-    std::vector<int> open_fds(ports.size(), -1);
+    std::optional<std::size_t> selected_port_index;
+    std::vector<int> open_fds(endpoints.size(), -1);
 #endif
 
     while (std::getline(file, line)) {
@@ -483,39 +588,75 @@ bool run_command_file(const std::string& path, const std::vector<SerialPortInfo>
             continue;
         } else if (command.rfind(":print", 0) == 0) {
             std::cout << print_argument(command) << '\n';
+        } else if (command.rfind(":delay", 0) == 0) {
+            std::istringstream args(trim(command.substr(6)));
+            int milliseconds = 0;
+            std::string extra;
+            if (!(args >> milliseconds) || (args >> extra) || milliseconds < 0) {
+                std::cerr << path << ':' << line_number << ": uso: :delay MILISEGUNDOS\n";
+                success = false;
+                continue;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+        } else if (command.rfind(":ether", 0) == 0) {
+            std::istringstream args(trim(command.substr(6)));
+            std::string ip;
+            int tcp_port = 0;
+            std::string extra;
+            if (!(args >> ip >> tcp_port) || (args >> extra) || tcp_port <= 0 || tcp_port > 65535) {
+                std::cerr << path << ':' << line_number << ": uso: :ether IP PUERTO\n";
+                success = false;
+                continue;
+            }
+
+#ifdef _WIN32
+            std::cerr << path << ':' << line_number << ": el envio por ethernet no esta soportado en Windows\n";
+            success = false;
+#else
+            const auto name = query_ethernet_endpoint(ip, tcp_port);
+            if (!name) {
+                success = false;
+                continue;
+            }
+
+            endpoints.push_back({SerialPortInfo::Kind::Ethernet, "", *name, 0, ip, tcp_port});
+            open_fds.push_back(-1);
+            std::cout << "Puerto ethernet registrado: (" << ip << ':' << tcp_port << ", " << *name << ")\n";
+#endif
         } else if (command.rfind(":use", 0) == 0) {
             const auto requested_name = lower_copy(trim(command.substr(4)));
-            const SerialPortInfo* match = nullptr;
-            for (const auto& port : ports) {
-                if (lower_copy(port.name) == requested_name) {
-                    match = &port;
+            std::optional<std::size_t> match_index;
+            for (std::size_t i = 0; i < endpoints.size(); ++i) {
+                if (lower_copy(endpoints[i].name) == requested_name) {
+                    match_index = i;
                     break;
                 }
             }
 
-            if (match == nullptr) {
+            if (!match_index) {
                 std::cerr << path << ':' << line_number << ": puerto no encontrado para :use " << trim(command.substr(4)) << '\n';
                 success = false;
                 continue;
             }
 
 #ifdef _WIN32
-            std::cerr << path << ':' << line_number << ": el envio por puerto serie no esta soportado en Windows\n";
+            std::cerr << path << ':' << line_number << ": el envio por puerto no esta soportado en Windows\n";
             success = false;
 #else
-            const auto port_index = static_cast<std::size_t>(match - ports.data());
+            const auto port_index = *match_index;
             if (open_fds[port_index] < 0) {
-                const auto fd = open_serial_port(*match);
+                const auto fd = open_endpoint(endpoints[port_index]);
                 if (!fd) {
                     success = false;
-                    selected_port = nullptr;
+                    selected_port_index.reset();
                     continue;
                 }
                 open_fds[port_index] = *fd;
             }
 
-            selected_port = match;
-            std::cout << "Usando " << selected_port->name << " en " << selected_port->port << '\n';
+            selected_port_index = port_index;
+            std::cout << "Usando " << endpoints[*selected_port_index].name << " en " << endpoint_label(endpoints[*selected_port_index]) << '\n';
 #endif
         } else if (command.rfind(":", 0) == 0) {
             std::cerr << path << ':' << line_number << ": comando no reconocido: " << command << '\n';
@@ -525,45 +666,48 @@ bool run_command_file(const std::string& path, const std::vector<SerialPortInfo>
             std::cerr << path << ':' << line_number << ": el envio por puerto serie no esta soportado en Windows: " << command << '\n';
             success = false;
 #else
-            if (selected_port == nullptr) {
+            if (!selected_port_index) {
                 std::cerr << path << ':' << line_number << ": no hay puerto seleccionado para enviar: " << command << '\n';
                 success = false;
                 continue;
             }
 
-            const auto port_index = static_cast<std::size_t>(selected_port - ports.data());
+            const auto port_index = *selected_port_index;
+            const auto& selected_port = endpoints[port_index];
             const int selected_fd = open_fds[port_index];
             if (selected_fd < 0) {
-                std::cerr << selected_port->port << ": el puerto seleccionado no esta abierto\n";
+                std::cerr << endpoint_label(selected_port) << ": el puerto seleccionado no esta abierto\n";
                 success = false;
                 continue;
             }
 
-            tcflush(selected_fd, TCIFLUSH);
+            if (selected_port.kind == SerialPortInfo::Kind::Serial) {
+                tcflush(selected_fd, TCIFLUSH);
+            }
 
             const auto serial_command = command + '\n';
             if (!write_all(selected_fd, serial_command)) {
-                std::cerr << selected_port->port << ": no se pudo enviar: " << command << '\n';
+                std::cerr << endpoint_label(selected_port) << ": no se pudo enviar: " << command << '\n';
                 success = false;
                 continue;
             }
 
             const auto response = trim(read_until_ok(selected_fd, std::chrono::seconds(60)));
             if (!response.empty()) {
-                std::cout << selected_port->name << ": " << response << '\n';
+                std::cout << selected_port.name << ": " << response << '\n';
             }
             if (response_has_error(response)) {
-                std::cerr << selected_port->port << ": el firmware devolvio error para: " << command << '\n';
+                std::cerr << endpoint_label(selected_port) << ": el firmware devolvio error para: " << command << '\n';
                 success = false;
             } else if (!response_has_ok(response)) {
-                std::cerr << selected_port->port << ": no se recibio OK para: " << command << '\n';
+                std::cerr << endpoint_label(selected_port) << ": no se recibio OK para: " << command << '\n';
                 success = false;
             } else if (is_g1_command(command)) {
-                if (!wait_until_complete(selected_fd, selected_port->port, command, false)) {
+                if (!wait_until_complete(selected_fd, endpoint_label(selected_port), command, false)) {
                     success = false;
                 }
             } else if (is_homing_command(command)) {
-                if (!wait_until_complete(selected_fd, selected_port->port, command, true)) {
+                if (!wait_until_complete(selected_fd, endpoint_label(selected_port), command, true)) {
                     success = false;
                 }
             }

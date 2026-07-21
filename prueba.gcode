@@ -8,6 +8,11 @@ g1 x20 f800
 $hz
 $ha
 $x
+:use Claw
+r 270
+:delay 2000
+r 200
+:use Cooking2
 g1 a6.5 f100
 g1 a0 f100
 $hb
