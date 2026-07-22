@@ -1,5 +1,6 @@
 #pruebas de Cooking
 :print Hola mundo
+:ether 192.168.1.7 20108
 :use cooking1
 $hx
 $x

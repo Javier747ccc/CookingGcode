@@ -180,7 +180,7 @@ bool is_homing_command(const std::string& command) {
 std::string clean_name_response(const std::string& response) {
     const auto cleaned = trim(response);
 
-    const std::vector<std::string> prefixes = {"$/name=", "$name="};
+    const std::vector<std::string> prefixes = {"$/name=", "$name=", "name="};
     for (const auto& prefix : prefixes) {
         if (cleaned.rfind(prefix, 0) == 0) {
             auto value = cleaned.substr(prefix.size());
@@ -198,6 +198,7 @@ std::string clean_name_response(const std::string& response) {
 bool is_negative_response_line(const std::string& line) {
     const auto lower = lower_copy(line);
     return lower == "ok" ||
+           lower == "fail" ||
            lower.find("[cli]") != std::string::npos ||
            lower.find("error") != std::string::npos ||
            lower.find("unknown") != std::string::npos ||
@@ -347,20 +348,43 @@ std::optional<std::string> query_port(const std::string& port, int baud) {
     tcflush(fd, TCIOFLUSH);
 
     const std::string command = "$name\n";
-    const ssize_t written = write(fd, command.data(), command.size());
-    if (written != static_cast<ssize_t>(command.size())) {
-        std::cerr << port << " @ " << baud << ": no se pudo escribir $name\n";
-        close_fd();
-        return std::nullopt;
+    const std::string fallback_command = "name\n";
+    bool fallback_sent = false;
+    if (!write_all(fd, command)) {
+        std::cerr << port << " @ " << baud << ": no se pudo escribir $name; intentando name\n";
+        if (!write_all(fd, fallback_command)) {
+            std::cerr << port << " @ " << baud << ": no se pudo escribir name\n";
+            close_fd();
+            return std::nullopt;
+        }
+        fallback_sent = true;
     }
 
-    const auto response = read_for(fd, std::chrono::milliseconds(1200));
-    close_fd();
+    auto response = read_for(fd, std::chrono::milliseconds(1200));
 
     if (const auto name = extract_name_response(response)) {
+        close_fd();
         std::cout << "Respuesta positiva en " << port << " @ " << baud << ": " << *name << '\n';
         return name;
     }
+
+    if (!fallback_sent) {
+        std::cerr << port << " @ " << baud << ": $name no devolvio nombre; intentando name\n";
+        if (!write_all(fd, fallback_command)) {
+            std::cerr << port << " @ " << baud << ": no se pudo escribir name\n";
+            close_fd();
+            return std::nullopt;
+        }
+
+        response = read_for(fd, std::chrono::milliseconds(1200));
+        if (const auto name = extract_name_response(response)) {
+            close_fd();
+            std::cout << "Respuesta positiva en " << port << " @ " << baud << ": " << *name << '\n';
+            return name;
+        }
+    }
+
+    close_fd();
 
     return std::nullopt;
 }
@@ -432,20 +456,43 @@ std::optional<std::string> query_ethernet_endpoint(const std::string& ip, int tc
     }
 
     const std::string command = "$name\n";
+    const std::string fallback_command = "name\n";
+    bool fallback_sent = false;
     if (!write_all(*fd, command)) {
-        std::cerr << ip << ':' << tcp_port << ": no se pudo escribir $name\n";
-        close(*fd);
-        return std::nullopt;
+        std::cerr << ip << ':' << tcp_port << ": no se pudo escribir $name; intentando name\n";
+        if (!write_all(*fd, fallback_command)) {
+            std::cerr << ip << ':' << tcp_port << ": no se pudo escribir name\n";
+            close(*fd);
+            return std::nullopt;
+        }
+        fallback_sent = true;
     }
 
-    const auto response = read_for(*fd, std::chrono::milliseconds(1200));
-    close(*fd);
+    auto response = read_for(*fd, std::chrono::milliseconds(1200));
 
     if (const auto name = extract_name_response(response)) {
+        close(*fd);
         std::cout << "Respuesta positiva en " << ip << ':' << tcp_port << ": " << *name << '\n';
         return name;
     }
 
+    if (!fallback_sent) {
+        std::cerr << ip << ':' << tcp_port << ": $name no devolvio nombre; intentando name\n";
+        if (!write_all(*fd, fallback_command)) {
+            std::cerr << ip << ':' << tcp_port << ": no se pudo escribir name\n";
+            close(*fd);
+            return std::nullopt;
+        }
+
+        response = read_for(*fd, std::chrono::milliseconds(1200));
+        if (const auto name = extract_name_response(response)) {
+            close(*fd);
+            std::cout << "Respuesta positiva en " << ip << ':' << tcp_port << ": " << *name << '\n';
+            return name;
+        }
+    }
+
+    close(*fd);
     std::cout << "Sin respuesta positiva en " << ip << ':' << tcp_port << '\n';
     return std::nullopt;
 }
