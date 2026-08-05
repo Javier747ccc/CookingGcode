@@ -1,0 +1,14 @@
+:print Iniciando receta
+:ether 192.168.1.7 20108
+# Fines de carrera
+:use Cooking1
+$x
+$hx
+:use Cooking2
+$x
+$ha
+$hz
+$hb
+#coger cazo
+:use Cooking1
+g1 x3 f800

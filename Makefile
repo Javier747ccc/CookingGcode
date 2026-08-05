@@ -1,18 +1,22 @@
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pedantic
 
-TARGET := cookinggcode-serial-scan
-SRC := main.cpp
+SERIAL_SCAN_TARGET := cookinggcode-serial-scan
+CONVERT_TARGET := cookinggcode-convert
+TARGETS := $(SERIAL_SCAN_TARGET) $(CONVERT_TARGET)
 
 .PHONY: all clean run
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SRC)
+$(SERIAL_SCAN_TARGET): main.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-run: $(TARGET)
-	./$(TARGET)
+$(CONVERT_TARGET): convert.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $<
+
+run: $(SERIAL_SCAN_TARGET)
+	./$(SERIAL_SCAN_TARGET)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)

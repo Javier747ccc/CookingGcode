@@ -1,0 +1,49 @@
+# Generado desde Pasta1.jcu usando cooking-actions.cfg
+:print Iniciando receta
+:ether 192.168.1.7 20108
+:use Cooking1
+$x
+$hx
+:use Cooking2
+$x
+$ha
+$hz
+$hb
+# Lechuga, 150
+:print Dosificando 150 de Lechuga
+:use Cooking1
+g1 x20 f800
+:use Cooking2
+g1 a6.5 f100
+g1 a0 f100
+# Tomate, 100
+:print Dosificando 100 de Tomate
+:use Cooking1
+g1 x40 f800
+:use Cooking2
+g1 a6.5 f100
+g1 a0 f100
+# Queso, 75
+:print Dosificando 75 de Queso
+:use Cooking1
+g1 x60 f800
+:use Cooking2
+g1 a6.5 f100
+g1 a0 f100
+# Atun, 175
+:print Dosificando 175 de Atun
+:use Cooking1
+g1 x80 f800
+:use Cooking2
+g1 a6.5 f100
+g1 a0 f100
+# Macarrones, 100
+:print Dosificando 100 de Macarrones
+:use Cooking1
+g1 x100 f800
+:use Cooking2
+g1 a6.5 f100
+g1 a0 f100
+:print Receta terminada
+:use Cooking1
+g1 x0 f800
